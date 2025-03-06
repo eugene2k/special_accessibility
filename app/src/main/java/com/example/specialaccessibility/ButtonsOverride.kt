@@ -1,7 +1,7 @@
 package com.example.specialaccessibility
 
 import android.accessibilityservice.AccessibilityService
-import android.app.ActivityManager
+import android.annotation.SuppressLint
 import android.app.admin.DeviceAdminReceiver
 import android.app.admin.DevicePolicyManager
 import android.content.BroadcastReceiver
@@ -9,77 +9,177 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
-import android.os.CountDownTimer
 import android.os.PowerManager
 import android.util.Log
 import android.view.KeyEvent
 import android.view.accessibility.AccessibilityEvent
+import android.view.accessibility.AccessibilityNodeInfo
 
+const val PROCESS_VIEW_CLICKED_EVENTS = false
+const val LIMITED_MODE_DISABLE = "com.example.specialaccessibility.LIMITED_MODE_DISABLE"
 
-class ButtonsOverride: AccessibilityService() {
-    class SpecialDeviceAdminReceiver: DeviceAdminReceiver()
-    private var backPressRepeatCount = 0
-    private var deviceAdminReceiver: ComponentName? = null
-    private var timer = object : CountDownTimer(300, 1000) {
+class ActivityValidator {
+    companion object {
+        const val WHATSAPP_CALL = "com.whatsapp.voipcalling.VoipActivityV2"
+        const val VIBER_CALL = "com.viber.voip.phone.PhoneFragmentActivity"
+    }
 
-        override fun onTick(millisUntilFinished: Long) {
+    private val activitySequences: Array<Pair<String, Array<Int>>> = arrayOf(
+        Pair("com.example.viberlauncher.LockedActivity", arrayOf()),
+        Pair("android.widget.FrameLayout", arrayOf(0, 1)),
+        Pair(VIBER_CALL, arrayOf(0, 1)),
+        Pair(WHATSAPP_CALL, arrayOf(0, 1)),
+        Pair("org.telegram.ui.LaunchActivity", arrayOf(0, 1)),
+        Pair("com.viber.voip.HomeActivity", arrayOf(2)),
+    )
+    private val sequenceStarts = arrayOf(2, 3, 4, 5)
+    private var sequenceCursor = -1
+    fun isValid(activity: String): Boolean {
+        sequenceCursor = if (sequenceCursor == -1) {
+            sequenceStarts.find { activitySequences[it].first == activity } ?: -1
+        } else {
+            activitySequences[sequenceCursor].second.find { activitySequences[it].first == activity }
+                ?: -1
         }
+        return sequenceCursor != -1
+    }
 
-        override fun onFinish() {
-            backPressRepeatCount = 0
+    fun reset() {
+        sequenceCursor = -1
+    }
+}
+
+val PACKAGE_INSTALLER_ACTIVITIES = arrayOf(
+    "com.android.packageinstaller.permission.ui.GrantPermissionsActivity",
+    "com.google.android.packageinstaller"
+)
+
+class ButtonsOverride : AccessibilityService() {
+    class SpecialDeviceAdminReceiver : DeviceAdminReceiver()
+
+    private var deviceAdminReceiver: ComponentName? = null
+    private var limitedMode = false
+    private val disableLimitedModeHandler = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            limitedMode = false
+            Log.i(this.javaClass.name, "Limited mode disabled")
         }
     }
 
+    private var activityValidator = ActivityValidator()
+
+    private var wakeLock: PowerManager.WakeLock? = null
+    private var lockDevice = false
+    private var endCallButton: AccessibilityNodeInfo? = null
+
+    @SuppressLint("UnspecifiedRegisterReceiverFlag")
     override fun onCreate() {
         super.onCreate()
         deviceAdminReceiver = ComponentName(this, SpecialDeviceAdminReceiver::class.java)
-        Log.i("Buttons Override", "Service created")
+        val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+        wakeLock = powerManager.newWakeLock(
+            PowerManager.PROXIMITY_SCREEN_OFF_WAKE_LOCK,
+            this.javaClass.name
+        )
+        registerReceiver(disableLimitedModeHandler, IntentFilter(LIMITED_MODE_DISABLE))
+
+        Log.i(this.javaClass.name, "Service created")
     }
+
 
     override fun onServiceConnected() {
         super.onServiceConnected()
-        Log.i("Buttons Override", "Service connected")
+        Log.i(this.javaClass.name, "Service connected")
         val formatted = serviceInfo.toString()
             .replace(", ", ",\n   ")
-        Log.i("Buttons Override", "ServiceInfo {\n   %s\n}".format(formatted))
-
-//        val intentFilterACSD = IntentFilter(Intent.ACTION_CLOSE_SYSTEM_DIALOGS)
-//
-//        val broadcastReceiver: BroadcastReceiver = object : BroadcastReceiver() {
-//            override fun onReceive(context: Context, intent: Intent) {
-//                if (intent.action == Intent.ACTION_CLOSE_SYSTEM_DIALOGS) {
-//                    //do what you want here
-//                    val activityManager = getSystemService(ACTIVITY_SERVICE) as ActivityManager
-//
-//                    val taskId = activityManager.getRecentTasks(1, 0)[0].id
-//                    activityManager.moveTaskToFront(taskId, 0)
-//                }
-//            }
-//        }
-//        this.registerReceiver(broadcastReceiver, intentFilterACSD)
+        Log.i(this.javaClass.name, "ServiceInfo {\n   %s\n}".format(formatted))
     }
 
+    @OptIn(ExperimentalStdlibApi::class)
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event != null) {
-            if (event.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED || event.className == null)
-                return
+            when (event.eventType) {
+                AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED -> {
+                    Log.i(this.javaClass.name, event.packageName?.toString() ?: "<null>")
+                    Log.i(this.javaClass.name, event.className.toString())
+                    Log.i(this.javaClass.name, "limitedMode=%b".format(limitedMode))
+                    lockDevice = false
+                    endCallButton = null
+                    if (event.packageName !in PACKAGE_INSTALLER_ACTIVITIES) {
+                        if (event.packageName =="com.example.viberlauncher") {
+                            if (event.className =="com.example.viberlauncher.LockedActivity") {
+                                activityValidator.reset()
+                                if (wakeLock!!.isHeld)
+                                    wakeLock!!.release()
+                                lockDevice = true
+                                limitedMode = true
+                                Log.i(this.javaClass.name, "Limited mode enabled")
+                            }
+                        } else {
+                            if (limitedMode) {
+                                if (!activityValidator.isValid(event.className.toString())) {
+                                    startViberLauncher()
+                                } else {
+                                    val phoneActivities = arrayOf(
+                                        ActivityValidator.WHATSAPP_CALL,
+                                        ActivityValidator.VIBER_CALL
+                                    )
+                                    val activity = event.className.toString()
+                                    if (activity in phoneActivities) {
+                                        lockDevice = true
+                                        if (PROCESS_VIEW_CLICKED_EVENTS) {
+                                            assert(event.source != null)
+                                            val childCount = event.source!!.childCount
+                                            for (i in 0..<childCount) {
+                                                val child = event.source!!.getChild(i)
+                                                Log.i(
+                                                    this.javaClass.name,
+                                                    "%d - %s".format(
+                                                        i,
+                                                        child.hashCode().toHexString()
+                                                    )
+                                                )
+                                            }
+                                        }
+                                    }
+                                    if (activity == ActivityValidator.WHATSAPP_CALL) {
+                                        if (!wakeLock!!.isHeld) wakeLock!!.acquire(120 * 60 * 1000L /*120 minutes*/)
+                                        val toggleSpeakerButton = event.source?.getChild(6)
+                                        toggleSpeakerButton?.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                                        endCallButton = event.source?.getChild(4)
+                                    } else if (activity == ActivityValidator.VIBER_CALL) {
+                                        val toggleSpeakerButton = event.source?.getChild(0)
+                                        toggleSpeakerButton?.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                                        endCallButton = event.source?.getChild(3)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
 
-            val recentsNames = arrayOf(
-                "com.android.internal.policy.impl.RecentApplicationsDialog",
-                "com.android.systemui.recent.RecentsActivity",
-                "com.android.systemui.recents.RecentsActivity")
+                AccessibilityEvent.TYPE_VIEW_CLICKED -> {
+                    assert(event.source != null)
+                    val name = event.source.hashCode().toHexString()
+                    Log.i(this.javaClass.name, name)
+                }
 
-            if (event.className.toString() in recentsNames) {
-                Log.i("Buttons Override", "Found matching activity")
-                val activityManager = getSystemService(ACTIVITY_SERVICE) as ActivityManager
-
-                val taskId = activityManager.getRecentTasks(1,0)[0].id
-                activityManager.moveTaskToFront(taskId, 0)
-
-            } else {
-                Log.i("Buttons Override", "Found no matching activities")
+                else -> {
+                    Log.i(this.javaClass.name, event.eventType.toHexString())
+                }
             }
         }
+    }
+
+    private fun startViberLauncher() {
+        val intent = Intent()
+        intent.component =
+            ComponentName(
+                "com.example.viberlauncher",
+                "com.example.viberlauncher.LockedActivity"
+            )
+        intent.flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+        startActivity(intent)
     }
 
     override fun onInterrupt() {
@@ -90,56 +190,43 @@ class ButtonsOverride: AccessibilityService() {
             return super.onKeyEvent(event)
         }
         when (event.keyCode) {
-            KeyEvent.KEYCODE_HOME -> {
-                val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
-                if (pm.isInteractive) {
-                    val dpm = this.getSystemService(Context.DEVICE_POLICY_SERVICE) as DevicePolicyManager
-                    if (!dpm.isAdminActive(deviceAdminReceiver!!)) {
-                        Log.i("Buttons Override", "Not admin")
-                    } else {
-                        val startMain = Intent(Intent.ACTION_MAIN)
-                        startMain.addCategory(Intent.CATEGORY_HOME)
-                        startMain.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                        startActivity(startMain)
-
-                        dpm.lockNow()
-                    }
-                }
-                Log.i("ButtonsOverride","HOME button pressed!")
-                return super.onKeyEvent(event)
-            }
-            KeyEvent.KEYCODE_RECENT_APPS -> {
-                Log.i("ButtonsOverride","RECENT APPS button pressed!")
-                return true
-            }
-            KeyEvent.KEYCODE_APP_SWITCH -> {
-                Log.i("ButtonsOverride","APP SWITCH button pressed!")
-
-                return true
-            }
-            KeyEvent.KEYCODE_BACK -> {
-                timer.cancel()
-                backPressRepeatCount += 1
-                timer.start()
-                return if (backPressRepeatCount < 3) {
-                    Log.i("ButtonsOverride","BACK button pressed!")
-                    true
-                } else {
-                    Log.i("ButtonsOverride","BACK button pressed three times in succession!")
-                    super.onKeyEvent(event)
-                }
-            }
             KeyEvent.KEYCODE_VOLUME_DOWN -> {
-                Log.i("ButtonsOverride","VOLUME DOWN button pressed!")
+                Log.i(this.javaClass.name, "VOLUME DOWN button pressed!")
                 return true
             }
+
             KeyEvent.KEYCODE_VOLUME_UP -> {
-                Log.i("ButtonsOverride","VOLUME UP button pressed!")
+                Log.i(this.javaClass.name, "VOLUME UP button pressed!")
                 return true
             }
+
+            KeyEvent.KEYCODE_HOME -> {
+                Log.i(this.javaClass.name, "HOME button pressed")
+                if (lockDevice) {
+                    endCallButton?.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                    val dpm =
+                        getSystemService(Context.DEVICE_POLICY_SERVICE) as DevicePolicyManager
+                    dpm.lockNow()
+                } else {
+                    startViberLauncher()
+                }
+                return true
+            }
+
+            KeyEvent.KEYCODE_BACK -> {
+                Log.i(this.javaClass.name, "BACK button pressed")
+                return if (limitedMode) true
+                else super.onKeyEvent(event)
+            }
+
             else -> {
                 return super.onKeyEvent(event)
             }
         }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        unregisterReceiver(disableLimitedModeHandler)
     }
 }

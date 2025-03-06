@@ -1,3 +1,8 @@
 <resources>
-    <string name="app_name">SpecialAccessibility</string>
+    <string name="app_name">Упрощенное Пользование</string>
+    <string name="main_title">Настройки Упрощенного Пользования</string>
+    <string name="modify_back_button_behavior">Поведение кнопки "Назад"</string>
+    <string name="button_press_count">Количество нажатий</string>
+    <string name="apply_changes">Применить</string>
+    <string name="service_description">Упрощает использование телефона</string>
 </resources>
